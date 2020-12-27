@@ -3,6 +3,7 @@ package model
 import (
 	"fmt"
 	"io"
+	"reflect"
 	"regexp"
 	"strings"
 
@@ -13,10 +14,11 @@ import (
 
 // Workflow is the structure of the files in .github/workflows
 type Workflow struct {
-	Name  string            `yaml:"name"`
-	RawOn yaml.Node         `yaml:"on"`
-	Env   map[string]string `yaml:"env"`
-	Jobs  map[string]*Job   `yaml:"jobs"`
+	Name     string            `yaml:"name"`
+	RawOn    yaml.Node         `yaml:"on"`
+	Env      map[string]string `yaml:"env"`
+	Jobs     map[string]*Job   `yaml:"jobs"`
+	Defaults Defaults          `yaml:"defaults"`
 }
 
 // On events for the workflow
@@ -64,6 +66,7 @@ type Job struct {
 	Services       map[string]*ContainerSpec `yaml:"services"`
 	Strategy       *Strategy                 `yaml:"strategy"`
 	RawContainer   yaml.Node                 `yaml:"container"`
+	Defaults       Defaults                  `yaml:"defaults"`
 }
 
 // Strategy for the job
@@ -71,6 +74,17 @@ type Strategy struct {
 	FailFast    bool                     `yaml:"fail-fast"`
 	MaxParallel int                      `yaml:"max-parallel"`
 	Matrix      map[string][]interface{} `yaml:"matrix"`
+}
+
+// Default settings that will apply to all steps in the job or workflow
+type Defaults struct {
+	Run RunDefaults `yaml:"run"`
+}
+
+// Defaults for all run steps in the job or workflow
+type RunDefaults struct {
+	Shell            string `yaml:"shell"`
+	WorkingDirectory string `yaml:"working-directory"`
 }
 
 // Container details for the job
@@ -163,15 +177,11 @@ func (j *Job) GetMatrixes() []map[string]interface{} {
 					continue MATRIX
 				}
 			}
-			for _, include := range includes {
-				if commonKeysMatch(matrix, include) {
-					log.Debugf("Setting add'l values on matrix '%v' due to include '%v'", matrix, include)
-					for k, v := range include {
-						matrix[k] = v
-					}
-				}
-			}
 			matrixes = append(matrixes, matrix)
+		}
+		for _, include := range includes {
+			log.Debugf("Adding include '%v'", include)
+			matrixes = append(matrixes, include)
 		}
 
 	} else {
@@ -182,7 +192,7 @@ func (j *Job) GetMatrixes() []map[string]interface{} {
 
 func commonKeysMatch(a map[string]interface{}, b map[string]interface{}) bool {
 	for aKey, aVal := range a {
-		if bVal, ok := b[aKey]; ok && aVal != bVal {
+		if bVal, ok := b[aKey]; ok && ! reflect.DeepEqual(aVal, bVal) {
 			return false
 		}
 	}
@@ -276,10 +286,10 @@ const (
 	//StepTypeUsesDockerURL is all steps that have a `uses` that is of the form `docker://...`
 	StepTypeUsesDockerURL
 
-	//StepTypeUsesActionLocal is all steps that have a `uses` that is a reference to a github repo
+	//StepTypeUsesActionLocal is all steps that have a `uses` that is a local action in a subdirectory
 	StepTypeUsesActionLocal
 
-	//StepTypeUsesActionRemote is all steps that have a `uses` that is a local action in a subdirectory
+	//StepTypeUsesActionRemote is all steps that have a `uses` that is a reference to a github repo
 	StepTypeUsesActionRemote
 )
 

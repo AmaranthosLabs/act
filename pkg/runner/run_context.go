@@ -3,6 +3,7 @@ package runner
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -14,7 +15,6 @@ import (
 
 	"github.com/nektos/act/pkg/common"
 	"github.com/nektos/act/pkg/model"
-	"github.com/sirupsen/logrus"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -47,6 +47,7 @@ func (rc *RunContext) GetEnv() map[string]string {
 	if rc.Env == nil {
 		rc.Env = mergeMaps(rc.Config.Env, rc.Run.Workflow.Env, rc.Run.Job().Env)
 	}
+	rc.Env["ACT"] = "true"
 	return rc.Env
 }
 
@@ -104,6 +105,7 @@ func (rc *RunContext) startJobContainer() common.Executor {
 			Binds:       binds,
 			Stdout:      logWriter,
 			Stderr:      logWriter,
+			Privileged:  rc.Config.Privileged,
 		})
 
 		var copyWorkspace bool
@@ -118,14 +120,14 @@ func (rc *RunContext) startJobContainer() common.Executor {
 			rc.stopJobContainer(),
 			rc.JobContainer.Create(),
 			rc.JobContainer.Start(false),
-			rc.JobContainer.CopyDir(copyToPath, rc.Config.Workdir+"/.").IfBool(copyWorkspace),
+			rc.JobContainer.CopyDir(copyToPath, rc.Config.Workdir+string(filepath.Separator)+".").IfBool(copyWorkspace),
 			rc.JobContainer.Copy("/github/", &container.FileEntry{
 				Name: "workflow/event.json",
-				Mode: 644,
+				Mode: 0644,
 				Body: rc.EventJSON,
 			}, &container.FileEntry{
 				Name: "home/.act",
-				Mode: 644,
+				Mode: 0644,
 				Body: "",
 			}),
 		)(ctx)
@@ -199,13 +201,19 @@ func (rc *RunContext) newStepExecutor(step *model.Step) common.Executor {
 		_ = sc.setupEnv()(ctx)
 		rc.ExprEval = sc.NewExpressionEvaluator()
 
-		if !rc.EvalBool(sc.Step.If) {
+		runStep, err := rc.EvalBool(sc.Step.If)
+		if err != nil {
+			common.Logger(ctx).Errorf("  \u274C  Error in if: expression - %s", sc.Step)
+			rc.StepResults[rc.CurrentStep].Success = false
+			return err
+		}
+		if !runStep {
 			log.Debugf("Skipping step '%s' due to '%s'", sc.Step.String(), sc.Step.If)
 			return nil
 		}
 
 		common.Logger(ctx).Infof("\u2B50  Run %s", sc.Step)
-		err := sc.Executor()(ctx)
+		err = sc.Executor()(ctx)
 		if err == nil {
 			common.Logger(ctx).Infof("  \u2705  Success - %s", sc.Step)
 		} else {
@@ -221,7 +229,7 @@ func (rc *RunContext) platformImage() string {
 
 	c := job.Container()
 	if c != nil {
-		return c.Image
+		return rc.ExprEval.Interpolate(c.Image)
 	}
 
 	for _, runnerLabel := range job.RunsOn() {
@@ -238,31 +246,81 @@ func (rc *RunContext) platformImage() string {
 func (rc *RunContext) isEnabled(ctx context.Context) bool {
 	job := rc.Run.Job()
 	l := common.Logger(ctx)
-	if !rc.EvalBool(job.If) {
+	runJob, err := rc.EvalBool(job.If)
+	if err != nil {
+		common.Logger(ctx).Errorf("  \u274C  Error in if: expression - %s", job.Name)
+		return false
+	}
+	if !runJob {
 		l.Debugf("Skipping job '%s' due to '%s'", job.Name, job.If)
 		return false
 	}
 
 	img := rc.platformImage()
 	if img == "" {
-		l.Infof("\U0001F6A7  Skipping unsupported platform '%+v'", job.RunsOn())
+		for _, runnerLabel := range job.RunsOn() {
+			platformName := rc.ExprEval.Interpolate(runnerLabel)
+			l.Infof("\U0001F6A7  Skipping unsupported platform '%+v'", platformName)
+		}
 		return false
 	}
 	return true
 }
 
 // EvalBool evaluates an expression against current run context
-func (rc *RunContext) EvalBool(expr string) bool {
+func (rc *RunContext) EvalBool(expr string) (bool, error) {
+	if strings.HasPrefix(strings.TrimSpace(expr), "!") {
+		return false, errors.New("expressions starting with ! must be wrapped in ${{ }}")
+	}
 	if expr != "" {
-		expr = fmt.Sprintf("Boolean(%s)", rc.ExprEval.Interpolate(expr))
-		v, err := rc.ExprEval.Evaluate(expr)
+		splitPattern := regexp.MustCompile(fmt.Sprintf(`%s|%s|\S+`, expressionPattern.String(), operatorPattern.String()))
+
+		parts := splitPattern.FindAllString(expr, -1)
+		var evaluatedParts []string
+		for i, part := range parts {
+			if operatorPattern.MatchString(part) {
+				evaluatedParts = append(evaluatedParts, part)
+				continue
+			}
+
+			interpolatedPart, isString := rc.ExprEval.InterpolateWithStringCheck(part)
+
+			// This peculiar transformation has to be done because the Github parser
+			// treats false retured from contexts as a string, not a boolean.
+			// Hence env.SOMETHING will be evaluated to true in an if: expression
+			// regardless if SOMETHING is set to false, true or any other string.
+			// It also handles some other weirdness that I found by trial and error.
+			if (expressionPattern.MatchString(part) && // it is an expression
+				!strings.Contains(part, "!")) && // but it's not negated
+				interpolatedPart == "false" && // and the interpolated string is false
+				(isString || previousOrNextPartIsAnOperator(i, parts)) { // and it's of type string or has an logical operator before or after
+
+				interpolatedPart = fmt.Sprintf("'%s'", interpolatedPart) // then we have to quote the false expression
+			}
+
+			evaluatedParts = append(evaluatedParts, interpolatedPart)
+		}
+
+		joined := strings.Join(evaluatedParts, " ")
+		v, _, err := rc.ExprEval.Evaluate(fmt.Sprintf("Boolean(%s)", joined))
 		if err != nil {
-			return false
+			return false, nil
 		}
 		log.Debugf("expression '%s' evaluated to '%s'", expr, v)
-		return v == "true"
+		return v == "true", nil
 	}
-	return true
+	return true, nil
+}
+
+func previousOrNextPartIsAnOperator(i int, parts []string) bool {
+	operator := false
+	if i > 0 {
+		operator = operatorPattern.MatchString(parts[i-1])
+	}
+	if i+1 < len(parts) {
+		operator = operator || operatorPattern.MatchString(parts[i+1])
+	}
+	return operator
 }
 
 func mergeMaps(maps ...map[string]string) map[string]string {
@@ -350,13 +408,20 @@ func (rc *RunContext) getGithubContext() *githubContext {
 	if !ok {
 		token = os.Getenv("GITHUB_TOKEN")
 	}
-
+	runID := rc.Config.Env["GITHUB_RUN_ID"]
+	if runID == "" {
+		runID = "1"
+	}
+	runNumber := rc.Config.Env["GITHUB_RUN_NUMBER"]
+	if runNumber == "" {
+		runNumber = "1"
+	}
 	ghc := &githubContext{
 		Event:     make(map[string]interface{}),
 		EventPath: "/github/workflow/event.json",
 		Workflow:  rc.Run.Workflow.Name,
-		RunID:     "1",
-		RunNumber: "1",
+		RunID:     runID,
+		RunNumber: runNumber,
 		Actor:     rc.Config.Actor,
 		EventName: rc.Config.EventName,
 		Token:     token,
@@ -395,8 +460,15 @@ func (rc *RunContext) getGithubContext() *githubContext {
 	if rc.EventJSON != "" {
 		err = json.Unmarshal([]byte(rc.EventJSON), &ghc.Event)
 		if err != nil {
-			logrus.Errorf("Unable to Unmarshal event '%s': %v", rc.EventJSON, err)
+			log.Errorf("Unable to Unmarshal event '%s': %v", rc.EventJSON, err)
 		}
+	}
+
+	// set the branch in the event data
+	if rc.Config.DefaultBranch != "" {
+		ghc.Event = withDefaultBranch(rc.Config.DefaultBranch, ghc.Event)
+	} else {
+		ghc.Event = withDefaultBranch("master", ghc.Event)
 	}
 
 	if ghc.EventName == "pull_request" {
@@ -451,8 +523,32 @@ func nestedMapLookup(m map[string]interface{}, ks ...string) (rval interface{}) 
 	}
 }
 
+func withDefaultBranch(b string, event map[string]interface{}) map[string]interface{} {
+	repoI, ok := event["repository"]
+	if !ok {
+		repoI = make(map[string]interface{})
+	}
+
+	repo, ok := repoI.(map[string]interface{})
+	if !ok {
+		log.Warnf("unable to set default branch to %v", b)
+		return event
+	}
+
+	// if the branch is already there return with no changes
+	if _, ok = repo["default_branch"]; ok {
+		return event
+	}
+
+	repo["default_branch"] = b
+	event["repository"] = repo
+
+	return event
+}
+
 func (rc *RunContext) withGithubEnv(env map[string]string) map[string]string {
 	github := rc.getGithubContext()
+	env["CI"] = "true"
 	env["HOME"] = "/github/home"
 	env["GITHUB_WORKFLOW"] = github.Workflow
 	env["GITHUB_RUN_ID"] = github.RunID
