@@ -2,6 +2,7 @@ package container
 
 import (
 	"archive/tar"
+	"bufio"
 	"bytes"
 	"context"
 	"fmt"
@@ -9,11 +10,14 @@ import (
 	"io/ioutil"
 	"os"
 	"path/filepath"
+	"regexp"
+	"runtime"
 	"strings"
 
 	"github.com/go-git/go-billy/v5/helper/polyfill"
 	"github.com/go-git/go-billy/v5/osfs"
 	"github.com/go-git/go-git/v5/plumbing/format/gitignore"
+	"github.com/joho/godotenv"
 
 	"github.com/docker/cli/cli/connhelper"
 	"github.com/docker/docker/api/types"
@@ -21,15 +25,21 @@ import (
 	"github.com/docker/docker/api/types/mount"
 	"github.com/docker/docker/client"
 	"github.com/docker/docker/pkg/stdcopy"
-	"github.com/nektos/act/pkg/common"
+	specs "github.com/opencontainers/image-spec/specs-go/v1"
+
+	"github.com/Masterminds/semver"
 	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
-	"golang.org/x/crypto/ssh/terminal"
+	"golang.org/x/term"
+
+	"github.com/nektos/act/pkg/common"
 )
 
 // NewContainerInput the input for the New function
 type NewContainerInput struct {
 	Image       string
+	Username    string
+	Password    string
 	Entrypoint  []string
 	Cmd         []string
 	WorkingDir  string
@@ -41,6 +51,9 @@ type NewContainerInput struct {
 	Stderr      io.Writer
 	NetworkMode string
 	Privileged  bool
+	UsernsMode  string
+	Platform    string
+	Hostname    string
 }
 
 // FileEntry is a file to copy to a container
@@ -52,13 +65,18 @@ type FileEntry struct {
 
 // Container for managing docker run containers
 type Container interface {
-	Create() common.Executor
+	Create(capAdd []string, capDrop []string) common.Executor
 	Copy(destPath string, files ...*FileEntry) common.Executor
-	CopyDir(destPath string, srcPath string) common.Executor
+	CopyDir(destPath string, srcPath string, useGitIgnore bool) common.Executor
+	GetContainerArchive(ctx context.Context, srcPath string) (io.ReadCloser, error)
 	Pull(forcePull bool) common.Executor
 	Start(attach bool) common.Executor
-	Exec(command []string, env map[string]string) common.Executor
+	Exec(command []string, env map[string]string, user, workdir string) common.Executor
+	UpdateFromEnv(srcPath string, env *map[string]string) common.Executor
+	UpdateFromImageEnv(env *map[string]string) common.Executor
+	UpdateFromPath(env *map[string]string) common.Executor
 	Remove() common.Executor
+	Close() common.Executor
 }
 
 // NewContainer creates a reference to a container
@@ -68,20 +86,40 @@ func NewContainer(input *NewContainerInput) Container {
 	return cr
 }
 
-func (cr *containerReference) Create() common.Executor {
+// supportsContainerImagePlatform returns true if the underlying Docker server
+// API version is 1.41 and beyond
+func supportsContainerImagePlatform(cli *client.Client) bool {
+	ctx := context.TODO()
+	logger := common.Logger(ctx)
+	ver, err := cli.ServerVersion(ctx)
+	if err != nil {
+		logger.Panicf("Failed to get Docker API Version: %s", err)
+		return false
+	}
+	sv, err := semver.NewVersion(ver.APIVersion)
+	if err != nil {
+		logger.Panicf("Failed to unmarshal Docker Version: %s", err)
+		return false
+	}
+	constraint, _ := semver.NewConstraint(">= 1.41")
+	return constraint.Check(sv)
+}
+
+func (cr *containerReference) Create(capAdd []string, capDrop []string) common.Executor {
 	return common.
-		NewDebugExecutor("%sdocker create image=%s entrypoint=%+q cmd=%+q", logPrefix, cr.input.Image, cr.input.Entrypoint, cr.input.Cmd).
+		NewInfoExecutor("%sdocker create image=%s platform=%s entrypoint=%+q cmd=%+q", logPrefix, cr.input.Image, cr.input.Platform, cr.input.Entrypoint, cr.input.Cmd).
 		Then(
 			common.NewPipelineExecutor(
 				cr.connect(),
 				cr.find(),
-				cr.create(),
+				cr.create(capAdd, capDrop),
 			).IfNot(common.Dryrun),
 		)
 }
+
 func (cr *containerReference) Start(attach bool) common.Executor {
 	return common.
-		NewInfoExecutor("%sdocker run image=%s entrypoint=%+q cmd=%+q", logPrefix, cr.input.Image, cr.input.Entrypoint, cr.input.Cmd).
+		NewInfoExecutor("%sdocker run image=%s platform=%s entrypoint=%+q cmd=%+q", logPrefix, cr.input.Image, cr.input.Platform, cr.input.Entrypoint, cr.input.Cmd).
 		Then(
 			common.NewPipelineExecutor(
 				cr.connect(),
@@ -92,12 +130,21 @@ func (cr *containerReference) Start(attach bool) common.Executor {
 			).IfNot(common.Dryrun),
 		)
 }
+
 func (cr *containerReference) Pull(forcePull bool) common.Executor {
-	return NewDockerPullExecutor(NewDockerPullExecutorInput{
-		Image:     cr.input.Image,
-		ForcePull: forcePull,
-	})
+	return common.
+		NewInfoExecutor("%sdocker pull image=%s platform=%s username=%s forcePull=%t", logPrefix, cr.input.Image, cr.input.Platform, cr.input.Username, forcePull).
+		Then(
+			NewDockerPullExecutor(NewDockerPullExecutorInput{
+				Image:     cr.input.Image,
+				ForcePull: forcePull,
+				Platform:  cr.input.Platform,
+				Username:  cr.input.Username,
+				Password:  cr.input.Password,
+			}),
+		)
 }
+
 func (cr *containerReference) Copy(destPath string, files ...*FileEntry) common.Executor {
 	return common.NewPipelineExecutor(
 		cr.connect(),
@@ -106,24 +153,40 @@ func (cr *containerReference) Copy(destPath string, files ...*FileEntry) common.
 	).IfNot(common.Dryrun)
 }
 
-func (cr *containerReference) CopyDir(destPath string, srcPath string) common.Executor {
+func (cr *containerReference) CopyDir(destPath string, srcPath string, useGitIgnore bool) common.Executor {
 	return common.NewPipelineExecutor(
 		common.NewInfoExecutor("%sdocker cp src=%s dst=%s", logPrefix, srcPath, destPath),
-		cr.connect(),
-		cr.find(),
-		cr.exec([]string{"mkdir", "-p", destPath}, nil),
-		cr.copyDir(destPath, srcPath),
+		cr.Exec([]string{"mkdir", "-p", destPath}, nil, "", ""),
+		cr.copyDir(destPath, srcPath, useGitIgnore),
 	).IfNot(common.Dryrun)
 }
 
-func (cr *containerReference) Exec(command []string, env map[string]string) common.Executor {
+func (cr *containerReference) GetContainerArchive(ctx context.Context, srcPath string) (io.ReadCloser, error) {
+	a, _, err := cr.cli.CopyFromContainer(ctx, cr.id, srcPath)
+	return a, err
+}
 
+func (cr *containerReference) UpdateFromEnv(srcPath string, env *map[string]string) common.Executor {
+	return cr.extractEnv(srcPath, env).IfNot(common.Dryrun)
+}
+
+func (cr *containerReference) UpdateFromImageEnv(env *map[string]string) common.Executor {
+	return cr.extractFromImageEnv(env).IfNot(common.Dryrun)
+}
+
+func (cr *containerReference) UpdateFromPath(env *map[string]string) common.Executor {
+	return cr.extractPath(env).IfNot(common.Dryrun)
+}
+
+func (cr *containerReference) Exec(command []string, env map[string]string, user, workdir string) common.Executor {
 	return common.NewPipelineExecutor(
+		common.NewInfoExecutor("%sdocker exec cmd=[%s] user=%s workdir=%s", logPrefix, strings.Join(command, " "), user, workdir),
 		cr.connect(),
 		cr.find(),
-		cr.exec(command, env),
+		cr.exec(command, env, user, workdir),
 	).IfNot(common.Dryrun)
 }
+
 func (cr *containerReference) Remove() common.Executor {
 	return common.NewPipelineExecutor(
 		cr.connect(),
@@ -184,6 +247,16 @@ func (cr *containerReference) connect() common.Executor {
 	}
 }
 
+func (cr *containerReference) Close() common.Executor {
+	return func(ctx context.Context) error {
+		if cr.cli != nil {
+			cr.cli.Close()
+			cr.cli = nil
+		}
+		return nil
+	}
+}
+
 func (cr *containerReference) find() common.Executor {
 	return func(ctx context.Context) error {
 		if cr.id != "" {
@@ -196,10 +269,10 @@ func (cr *containerReference) find() common.Executor {
 			return errors.WithStack(err)
 		}
 
-		for _, container := range containers {
-			for _, name := range container.Names {
+		for _, c := range containers {
+			for _, name := range c.Names {
 				if name[1:] == cr.input.Name {
-					cr.id = container.ID
+					cr.id = c.ID
 					return nil
 				}
 			}
@@ -231,15 +304,15 @@ func (cr *containerReference) remove() common.Executor {
 	}
 }
 
-func (cr *containerReference) create() common.Executor {
+func (cr *containerReference) create(capAdd []string, capDrop []string) common.Executor {
 	return func(ctx context.Context) error {
 		if cr.id != "" {
 			return nil
 		}
 		logger := common.Logger(ctx)
-		isTerminal := terminal.IsTerminal(int(os.Stdout.Fd()))
-
+		isTerminal := term.IsTerminal(int(os.Stdout.Fd()))
 		input := cr.input
+
 		config := &container.Config{
 			Image:      input.Image,
 			Cmd:        input.Cmd,
@@ -247,6 +320,7 @@ func (cr *containerReference) create() common.Executor {
 			WorkingDir: input.WorkingDir,
 			Env:        input.Env,
 			Tty:        isTerminal,
+			Hostname:   input.Hostname,
 		}
 
 		mounts := make([]mount.Mount, 0)
@@ -258,16 +332,32 @@ func (cr *containerReference) create() common.Executor {
 			})
 		}
 
+		var platSpecs *specs.Platform
+		if supportsContainerImagePlatform(cr.cli) && cr.input.Platform != "" {
+			desiredPlatform := strings.SplitN(cr.input.Platform, `/`, 2)
+
+			if len(desiredPlatform) != 2 {
+				logger.Panicf("Incorrect container platform option. %s is not a valid platform.", cr.input.Platform)
+			}
+
+			platSpecs = &specs.Platform{
+				Architecture: desiredPlatform[1],
+				OS:           desiredPlatform[0],
+			}
+		}
 		resp, err := cr.cli.ContainerCreate(ctx, config, &container.HostConfig{
+			CapAdd:      capAdd,
+			CapDrop:     capDrop,
 			Binds:       input.Binds,
 			Mounts:      mounts,
 			NetworkMode: container.NetworkMode(input.NetworkMode),
 			Privileged:  input.Privileged,
-		}, nil, input.Name)
+			UsernsMode:  container.UsernsMode(input.UsernsMode),
+		}, nil, platSpecs, input.Name)
 		if err != nil {
 			return errors.WithStack(err)
 		}
-		logger.Debugf("Created container name=%s id=%v from image %v", input.Name, resp.ID, input.Image)
+		logger.Debugf("Created container name=%s id=%v from image %v (platform: %s)", input.Name, resp.ID, input.Image, input.Platform)
 		logger.Debugf("ENV ==> %v", input.Env)
 
 		cr.id = resp.ID
@@ -275,19 +365,150 @@ func (cr *containerReference) create() common.Executor {
 	}
 }
 
-func (cr *containerReference) exec(cmd []string, env map[string]string) common.Executor {
+var singleLineEnvPattern, mulitiLineEnvPattern *regexp.Regexp
+
+func (cr *containerReference) extractEnv(srcPath string, env *map[string]string) common.Executor {
+	if singleLineEnvPattern == nil {
+		// Single line pattern matches:
+		// SOME_VAR=data=moredata
+		// SOME_VAR=datamoredata
+		singleLineEnvPattern = regexp.MustCompile(`^([^=]*)\=(.*)$`)
+		mulitiLineEnvPattern = regexp.MustCompile(`^([^<]+)<<(\w+)$`)
+	}
+
+	localEnv := *env
+	return func(ctx context.Context) error {
+		envTar, _, err := cr.cli.CopyFromContainer(ctx, cr.id, srcPath)
+		if err != nil {
+			return nil
+		}
+		defer envTar.Close()
+		reader := tar.NewReader(envTar)
+		_, err = reader.Next()
+		if err != nil && err != io.EOF {
+			return errors.WithStack(err)
+		}
+		s := bufio.NewScanner(reader)
+		multiLineEnvKey := ""
+		multiLineEnvDelimiter := ""
+		multiLineEnvContent := ""
+		for s.Scan() {
+			line := s.Text()
+			if singleLineEnv := singleLineEnvPattern.FindStringSubmatch(line); singleLineEnv != nil {
+				localEnv[singleLineEnv[1]] = singleLineEnv[2]
+			}
+			if line == multiLineEnvDelimiter {
+				localEnv[multiLineEnvKey] = multiLineEnvContent
+				multiLineEnvKey, multiLineEnvDelimiter, multiLineEnvContent = "", "", ""
+			}
+			if multiLineEnvKey != "" && multiLineEnvDelimiter != "" {
+				if multiLineEnvContent != "" {
+					multiLineEnvContent += "\n"
+				}
+				multiLineEnvContent += line
+			}
+			if mulitiLineEnvStart := mulitiLineEnvPattern.FindStringSubmatch(line); mulitiLineEnvStart != nil {
+				multiLineEnvKey = mulitiLineEnvStart[1]
+				multiLineEnvDelimiter = mulitiLineEnvStart[2]
+			}
+		}
+		env = &localEnv
+		return nil
+	}
+}
+
+func (cr *containerReference) extractFromImageEnv(env *map[string]string) common.Executor {
+	envMap := *env
 	return func(ctx context.Context) error {
 		logger := common.Logger(ctx)
+
+		inspect, _, err := cr.cli.ImageInspectWithRaw(ctx, cr.input.Image)
+		if err != nil {
+			logger.Error(err)
+		}
+
+		imageEnv, err := godotenv.Unmarshal(strings.Join(inspect.Config.Env, "\n"))
+		if err != nil {
+			logger.Error(err)
+		}
+
+		for k, v := range imageEnv {
+			if k == "PATH" {
+				if envMap[k] == "" {
+					envMap[k] = v
+				} else {
+					envMap[k] += `:` + v
+				}
+			} else if envMap[k] == "" {
+				envMap[k] = v
+			}
+		}
+
+		env = &envMap
+		return nil
+	}
+}
+
+func (cr *containerReference) extractPath(env *map[string]string) common.Executor {
+	localEnv := *env
+	return func(ctx context.Context) error {
+		pathTar, _, err := cr.cli.CopyFromContainer(ctx, cr.id, localEnv["GITHUB_PATH"])
+		if err != nil {
+			return errors.WithStack(err)
+		}
+		defer pathTar.Close()
+
+		reader := tar.NewReader(pathTar)
+		_, err = reader.Next()
+		if err != nil && err != io.EOF {
+			return errors.WithStack(err)
+		}
+		s := bufio.NewScanner(reader)
+		for s.Scan() {
+			line := s.Text()
+			localEnv["PATH"] = fmt.Sprintf("%s:%s", line, localEnv["PATH"])
+		}
+
+		env = &localEnv
+		return nil
+	}
+}
+
+func (cr *containerReference) exec(cmd []string, env map[string]string, user, workdir string) common.Executor {
+	return func(ctx context.Context) error {
+		logger := common.Logger(ctx)
+		// Fix slashes when running on Windows
+		if runtime.GOOS == "windows" {
+			var newCmd []string
+			for _, v := range cmd {
+				newCmd = append(newCmd, strings.ReplaceAll(v, `\`, `/`))
+			}
+			cmd = newCmd
+		}
+
 		logger.Debugf("Exec command '%s'", cmd)
-		isTerminal := terminal.IsTerminal(int(os.Stdout.Fd()))
+		isTerminal := term.IsTerminal(int(os.Stdout.Fd()))
 		envList := make([]string, 0)
 		for k, v := range env {
 			envList = append(envList, fmt.Sprintf("%s=%s", k, v))
 		}
 
+		var wd string
+		if workdir != "" {
+			if strings.HasPrefix(workdir, "/") {
+				wd = workdir
+			} else {
+				wd = fmt.Sprintf("%s/%s", cr.input.WorkingDir, workdir)
+			}
+		} else {
+			wd = cr.input.WorkingDir
+		}
+		logger.Debugf("Working directory '%s'", wd)
+
 		idResp, err := cr.cli.ContainerExecCreate(ctx, cr.id, types.ExecConfig{
+			User:         user,
 			Cmd:          cmd,
-			WorkingDir:   cr.input.WorkingDir,
+			WorkingDir:   wd,
 			Env:          envList,
 			Tty:          isTerminal,
 			AttachStderr: true,
@@ -303,6 +524,8 @@ func (cr *containerReference) exec(cmd []string, env map[string]string) common.E
 		if err != nil {
 			return errors.WithStack(err)
 		}
+		defer resp.Close()
+
 		var outWriter io.Writer
 		outWriter = cr.input.Stdout
 		if outWriter == nil {
@@ -311,13 +534,6 @@ func (cr *containerReference) exec(cmd []string, env map[string]string) common.E
 		errWriter := cr.input.Stderr
 		if errWriter == nil {
 			errWriter = os.Stderr
-		}
-
-		err = cr.cli.ContainerExecStart(ctx, idResp.ID, types.ExecStartCheck{
-			Tty: isTerminal,
-		})
-		if err != nil {
-			return errors.WithStack(err)
 		}
 
 		if !isTerminal || os.Getenv("NORAW") != "" {
@@ -343,7 +559,7 @@ func (cr *containerReference) exec(cmd []string, env map[string]string) common.E
 }
 
 // nolint: gocyclo
-func (cr *containerReference) copyDir(dstPath string, srcPath string) common.Executor {
+func (cr *containerReference) copyDir(dstPath string, srcPath string, useGitIgnore bool) common.Executor {
 	return func(ctx context.Context) error {
 		logger := common.Logger(ctx)
 		tarFile, err := ioutil.TempFile("", "act")
@@ -361,12 +577,15 @@ func (cr *containerReference) copyDir(dstPath string, srcPath string) common.Exe
 		}
 		log.Debugf("Stripping prefix:%s src:%s", srcPrefix, srcPath)
 
-		ps, err := gitignore.ReadPatterns(polyfill.New(osfs.New(srcPath)), nil)
-		if err != nil {
-			log.Debugf("Error loading .gitignore: %v", err)
-		}
+		var ignorer gitignore.Matcher
+		if useGitIgnore {
+			ps, err := gitignore.ReadPatterns(polyfill.New(osfs.New(srcPath)), nil)
+			if err != nil {
+				log.Debugf("Error loading .gitignore: %v", err)
+			}
 
-		ignorer := gitignore.NewMatcher(ps)
+			ignorer = gitignore.NewMatcher(ps)
+		}
 
 		err = filepath.Walk(srcPath, func(file string, fi os.FileInfo, err error) error {
 			if err != nil {
@@ -375,7 +594,7 @@ func (cr *containerReference) copyDir(dstPath string, srcPath string) common.Exe
 
 			sansPrefix := strings.TrimPrefix(file, srcPrefix)
 			split := strings.Split(sansPrefix, string(filepath.Separator))
-			if ignorer.Match(split, fi.IsDir()) {
+			if ignorer != nil && ignorer.Match(split, fi.IsDir()) {
 				if fi.IsDir() {
 					return filepath.SkipDir
 				}
@@ -492,7 +711,7 @@ func (cr *containerReference) attach() common.Executor {
 		if err != nil {
 			return errors.WithStack(err)
 		}
-		isTerminal := terminal.IsTerminal(int(os.Stdout.Fd()))
+		isTerminal := term.IsTerminal(int(os.Stdout.Fd()))
 
 		var outWriter io.Writer
 		outWriter = cr.input.Stdout

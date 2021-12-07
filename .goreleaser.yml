@@ -1,22 +1,28 @@
 before:
   hooks:
-  - go mod tidy
+    - go mod tidy
 builds:
-- env:
-  - CGO_ENABLED=0
-  goos:
-  - darwin
-  - linux
-  - windows
-  goarch:
-  - amd64
-  - 386
+  - env:
+      - CGO_ENABLED=0
+    goos:
+      - darwin
+      - linux
+      - windows
+    goarch:
+      - amd64
+      - 386
+      - arm64
+      - arm
+    goarm:
+      - 6
+      - 7
+    ignore:
+      - goos: windows
+        goarm: 6
 checksum:
   name_template: 'checksums.txt'
-snapshot:
-  name_template: "{{ .Env.SNAPSHOT_VERSION }}"
 archives:
-  - name_template: '{{ .ProjectName }}_{{ .Os }}_{{ .Arch }}'
+  - name_template: '{{ .ProjectName }}_{{ .Os }}_{{ .Arch }}{{ if .Arm }}v{{ .Arm }}{{ end }}{{ if .Mips }}_{{ .Mips }}{{ end }}'
     replacements:
       darwin: Darwin
       linux: Linux
@@ -24,14 +30,5 @@ archives:
       386: i386
       amd64: x86_64
     format_overrides:
-    - goos: windows
-      format: zip
-brews:
-  - github:
-      owner: nektos
-      name: homebrew-tap
-    folder: Formula
-    homepage:  https://github.com/nektos/act
-    description: Run GitHub Actions locally
-    test: |
-      system "#{bin}/act --version"
+      - goos: windows
+        format: zip

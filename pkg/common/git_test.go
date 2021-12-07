@@ -1,6 +1,7 @@
 package common
 
 import (
+	"context"
 	"fmt"
 	"io/ioutil"
 	"os"
@@ -9,6 +10,7 @@ import (
 	"syscall"
 	"testing"
 
+	log "github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -24,6 +26,7 @@ func TestFindGitSlug(t *testing.T) {
 		{"https://git-codecommit.us-east-1.amazonaws.com/v1/repos/my-repo-name", "CodeCommit", "my-repo-name"},
 		{"ssh://git-codecommit.us-west-2.amazonaws.com/v1/repos/my-repo", "CodeCommit", "my-repo"},
 		{"git@github.com:nektos/act.git", "GitHub", "nektos/act"},
+		{"git@github.com:nektos/act", "GitHub", "nektos/act"},
 		{"https://github.com/nektos/act.git", "GitHub", "nektos/act"},
 		{"http://github.com/nektos/act.git", "GitHub", "nektos/act"},
 		{"https://github.com/nektos/act", "GitHub", "nektos/act"},
@@ -33,13 +36,12 @@ func TestFindGitSlug(t *testing.T) {
 	}
 
 	for _, tt := range slugTests {
-		provider, slug, err := findGitSlug(tt.url)
+		provider, slug, err := findGitSlug(tt.url, "github.com")
 
 		assert.NoError(err)
 		assert.Equal(tt.provider, provider)
 		assert.Equal(tt.slug, slug)
 	}
-
 }
 
 func testDir(t *testing.T) string {
@@ -49,12 +51,35 @@ func testDir(t *testing.T) string {
 	return basedir
 }
 
+func cleanGitHooks(dir string) error {
+	hooksDir := filepath.Join(dir, ".git", "hooks")
+	files, err := ioutil.ReadDir(hooksDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	for _, f := range files {
+		if f.IsDir() {
+			continue
+		}
+		relName := filepath.Join(hooksDir, f.Name())
+		if err := os.Remove(relName); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func TestFindGitRemoteURL(t *testing.T) {
 	assert := assert.New(t)
 
 	basedir := testDir(t)
 	gitConfig()
 	err := gitCmd("init", basedir)
+	assert.NoError(err)
+	err = cleanGitHooks(basedir)
 	assert.NoError(err)
 
 	remoteURL := "https://git-codecommit.us-east-1.amazonaws.com/v1/repos/my-repo-name"
@@ -137,7 +162,8 @@ func TestGitFindRef(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			dir := filepath.Join(basedir, name)
 			require.NoError(t, os.MkdirAll(dir, 0755))
-			require.NoError(t, gitCmd("-C", dir, "init"))
+			require.NoError(t, gitCmd("-C", dir, "init", "--initial-branch=master"))
+			require.NoError(t, cleanGitHooks(dir))
 			tt.Prepare(t, dir)
 			ref, err := FindGitRef(dir)
 			tt.Assert(t, ref, err)
@@ -145,10 +171,57 @@ func TestGitFindRef(t *testing.T) {
 	}
 }
 
+func TestGitCloneExecutor(t *testing.T) {
+	for name, tt := range map[string]struct {
+		Err, URL, Ref string
+	}{
+		"tag": {
+			Err: "",
+			URL: "https://github.com/actions/checkout",
+			Ref: "v2",
+		},
+		"branch": {
+			Err: "",
+			URL: "https://github.com/anchore/scan-action",
+			Ref: "act-fails",
+		},
+		"sha": {
+			Err: "",
+			URL: "https://github.com/actions/checkout",
+			Ref: "5a4ac9002d0be2fb38bd78e4b4dbde5606d7042f", // v2
+		},
+		"short-sha": {
+			Err: "short SHA references are not supported: 5a4ac9002d0be2fb38bd78e4b4dbde5606d7042f",
+			URL: "https://github.com/actions/checkout",
+			Ref: "5a4ac90", // v2
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			clone := NewGitCloneExecutor(NewGitCloneExecutorInput{
+				URL: tt.URL,
+				Ref: tt.Ref,
+				Dir: testDir(t),
+			})
+
+			err := clone(context.Background())
+			if tt.Err == "" {
+				assert.Empty(t, err)
+			} else {
+				assert.EqualError(t, err, tt.Err)
+			}
+		})
+	}
+}
+
 func gitConfig() {
 	if os.Getenv("GITHUB_ACTIONS") == "true" {
-		_ = gitCmd("config", "--global", "user.email", "test@test.com")
-		_ = gitCmd("config", "--global", "user.name", "Unit Test")
+		var err error
+		if err = gitCmd("config", "--global", "user.email", "test@test.com"); err != nil {
+			log.Error(err)
+		}
+		if err = gitCmd("config", "--global", "user.name", "Unit Test"); err != nil {
+			log.Error(err)
+		}
 	}
 }
 

@@ -1,0 +1,15 @@
+on: push
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - shell: pwsh
+        run: |
+          $PSVersionTable
+  check-container:
+    runs-on: ubuntu-latest
+    container: ghcr.io/justingrote/act-pwsh:latest
+    steps:
+      - shell: pwsh
+        run: |
+          $PSVersionTable

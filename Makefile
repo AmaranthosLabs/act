@@ -1,13 +1,25 @@
 PREFIX ?= /usr/local
-VERSION ?= $(shell git describe --tags --dirty | cut -c 2-)
+VERSION ?= $(shell git describe --tags --dirty --always | sed -e 's/^v//')
 IS_SNAPSHOT = $(if $(findstring -, $(VERSION)),true,false)
 MAJOR_VERSION = $(word 1, $(subst ., ,$(VERSION)))
 MINOR_VERSION = $(word 2, $(subst ., ,$(VERSION)))
 PATCH_VERSION = $(word 3, $(subst ., ,$(word 1,$(subst -, , $(VERSION)))))
 NEW_VERSION ?= $(MAJOR_VERSION).$(MINOR_VERSION).$(shell echo $$(( $(PATCH_VERSION) + 1)) )
 
+fix = false
+ifeq (true,$(fix))
+	FIX = --fix
+endif
+
 ACT ?= go run main.go
-export GITHUB_TOKEN := $(shell cat ~/.config/github/token)
+
+HAS_TOKEN = $(if $(test -e ~/.config/github/token),true,false)
+ifeq (true,$(HAS_TOKEN))
+	export GITHUB_TOKEN := $(shell cat ~/.config/github/token)
+endif
+
+.PHONY: pr
+pr: tidy format-all lint test
 
 .PHONY: build
 build:
@@ -17,10 +29,55 @@ build:
 format:
 	go fmt ./...
 
+.PHONY: format-all
+format-all:
+	go fmt ./...
+	npx prettier --write .
+
 .PHONY: test
 test:
 	go test ./...
 	$(ACT)
+
+.PHONY: lint-go
+lint-go:
+	golangci-lint run $(FIX)
+
+.PHONY: lint-js
+lint-js:
+	npx standard $(FIX)
+
+.PHONY: lint-md
+lint-md:
+	npx markdownlint . $(FIX)
+
+.PHONY: lint-rest
+lint-rest:
+	docker run --rm -it \
+		-e 'RUN_LOCAL=true' \
+		-e 'FILTER_REGEX_EXCLUDE=.*testdata/*' \
+		-e 'VALIDATE_BASH=false' \
+		-e 'VALIDATE_DOCKERFILE=false' \
+		-e 'VALIDATE_DOCKERFILE_HADOLINT=false' \
+		-e 'VALIDATE_GO=false' \
+		-e 'VALIDATE_JSCPD=false' \
+		-e 'VALIDATE_SHELL_SHFMT=false' \
+		-v $(PWD):/tmp/lint \
+		github/super-linter
+
+.PHONY: lint
+lint: lint-go lint-rest
+
+.PHONY: lint-fix
+lint-fix: lint-md lint-go
+
+.PHONY: fix
+fix:
+	make lint-fix fix=true
+
+.PHONY: tidy
+tidy:
+	go mod tidy
 
 .PHONY: install
 install: build
@@ -47,3 +104,10 @@ ifneq ($(shell git status -s),)
 endif
 	git tag -a -m "releasing v$(NEW_VERSION)" v$(NEW_VERSION)
 	git push origin v$(NEW_VERSION)
+
+.PHONY: snapshot
+snapshot:
+	goreleaser build \
+		--rm-dist \
+		--single-target \
+		--snapshot

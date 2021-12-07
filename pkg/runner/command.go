@@ -13,7 +13,7 @@ var commandPatternADO *regexp.Regexp
 
 func init() {
 	commandPatternGA = regexp.MustCompile("^::([^ ]+)( (.+))?::([^\r\n]*)[\r\n]+$")
-	commandPatternADO = regexp.MustCompile("^##\\[([^ ]+)( (.+))?\\]([^\r\n]*)[\r\n]+$")
+	commandPatternADO = regexp.MustCompile("^##\\[([^ ]+)( (.+))?]([^\r\n]*)[\r\n]+$")
 }
 
 func (rc *RunContext) commandHandler(ctx context.Context) common.LineHandler {
@@ -54,7 +54,7 @@ func (rc *RunContext) commandHandler(ctx context.Context) common.LineHandler {
 		case "error":
 			logger.Infof("  \U00002757  %s", line)
 		case "add-mask":
-			logger.Infof("  \U00002699  %s", line)
+			logger.Infof("  \U00002699  %s", "***")
 		case "stop-commands":
 			resumeCommand = arg
 			logger.Infof("  \U00002699  %s", line)
@@ -77,8 +77,21 @@ func (rc *RunContext) setEnv(ctx context.Context, kvPairs map[string]string, arg
 	rc.Env[kvPairs["name"]] = arg
 }
 func (rc *RunContext) setOutput(ctx context.Context, kvPairs map[string]string, arg string) {
-	common.Logger(ctx).Infof("  \U00002699  ::set-output:: %s=%s", kvPairs["name"], arg)
-	rc.StepResults[rc.CurrentStep].Outputs[kvPairs["name"]] = arg
+	stepID := rc.CurrentStep
+	outputName := kvPairs["name"]
+	if outputMapping, ok := rc.OutputMappings[MappableOutput{StepID: stepID, OutputName: outputName}]; ok {
+		stepID = outputMapping.StepID
+		outputName = outputMapping.OutputName
+	}
+
+	result, ok := rc.StepResults[stepID]
+	if !ok {
+		common.Logger(ctx).Infof("  \U00002757  no outputs used step '%s'", stepID)
+		return
+	}
+
+	common.Logger(ctx).Infof("  \U00002699  ::set-output:: %s=%s", outputName, arg)
+	result.Outputs[outputName] = arg
 }
 func (rc *RunContext) addPath(ctx context.Context, arg string) {
 	common.Logger(ctx).Infof("  \U00002699  ::add-path:: %s", arg)
@@ -103,7 +116,7 @@ func unescapeCommandData(arg string) string {
 		"%0A": "\n",
 	}
 	for k, v := range escapeMap {
-		arg = strings.Replace(arg, k, v, -1)
+		arg = strings.ReplaceAll(arg, k, v)
 	}
 	return arg
 }
@@ -116,7 +129,7 @@ func unescapeCommandProperty(arg string) string {
 		"%2C": ",",
 	}
 	for k, v := range escapeMap {
-		arg = strings.Replace(arg, k, v, -1)
+		arg = strings.ReplaceAll(arg, k, v)
 	}
 	return arg
 }

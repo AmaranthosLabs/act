@@ -7,24 +7,33 @@ import (
 	"path/filepath"
 
 	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/builder/dockerignore"
 	"github.com/docker/docker/pkg/archive"
 	"github.com/docker/docker/pkg/fileutils"
-	"github.com/nektos/act/pkg/common"
+
+	// github.com/docker/docker/builder/dockerignore is deprecated
+	"github.com/moby/buildkit/frontend/dockerfile/dockerignore"
 	log "github.com/sirupsen/logrus"
+
+	"github.com/nektos/act/pkg/common"
 )
 
 // NewDockerBuildExecutorInput the input for the NewDockerBuildExecutor function
 type NewDockerBuildExecutorInput struct {
 	ContextDir string
+	Container  Container
 	ImageTag   string
+	Platform   string
 }
 
 // NewDockerBuildExecutor function to create a run executor for the container
 func NewDockerBuildExecutor(input NewDockerBuildExecutorInput) common.Executor {
 	return func(ctx context.Context) error {
 		logger := common.Logger(ctx)
-		logger.Infof("%sdocker build -t %s %s", logPrefix, input.ImageTag, input.ContextDir)
+		if input.Platform != "" {
+			logger.Infof("%sdocker build -t %s --platform %s %s", logPrefix, input.ImageTag, input.Platform, input.ContextDir)
+		} else {
+			logger.Infof("%sdocker build -t %s %s", logPrefix, input.ImageTag, input.ContextDir)
+		}
 		if common.Dryrun(ctx) {
 			return nil
 		}
@@ -33,23 +42,29 @@ func NewDockerBuildExecutor(input NewDockerBuildExecutorInput) common.Executor {
 		if err != nil {
 			return err
 		}
+		defer cli.Close()
 
 		logger.Debugf("Building image from '%v'", input.ContextDir)
 
 		tags := []string{input.ImageTag}
 		options := types.ImageBuildOptions{
-			Tags:   tags,
-			Remove: true,
+			Tags:     tags,
+			Remove:   true,
+			Platform: input.Platform,
 		}
-
-		buildContext, err := createBuildContext(input.ContextDir, "Dockerfile")
+		var buildContext io.ReadCloser
+		if input.Container != nil {
+			buildContext, err = input.Container.GetContainerArchive(ctx, input.ContextDir+"/.")
+		} else {
+			buildContext, err = createBuildContext(input.ContextDir, "Dockerfile")
+		}
 		if err != nil {
 			return err
 		}
 
 		defer buildContext.Close()
 
-		logger.Debugf("Creating image from context dir '%s' with tag '%s'", input.ContextDir, input.ImageTag)
+		logger.Debugf("Creating image from context dir '%s' with tag '%s' and platform '%s'", input.ContextDir, input.ImageTag, input.Platform)
 		resp, err := cli.ImageBuild(ctx, buildContext, options)
 
 		err = logDockerResponse(logger, resp.Body, err != nil)
@@ -58,7 +73,6 @@ func NewDockerBuildExecutor(input NewDockerBuildExecutorInput) common.Executor {
 		}
 		return nil
 	}
-
 }
 func createBuildContext(contextDir string, relDockerfile string) (io.ReadCloser, error) {
 	log.Debugf("Creating archive for build context dir '%s' with relative dockerfile '%s'", contextDir, relDockerfile)

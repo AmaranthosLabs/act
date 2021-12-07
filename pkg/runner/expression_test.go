@@ -4,16 +4,28 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"sort"
 	"testing"
 
 	"github.com/nektos/act/pkg/model"
-	a "github.com/stretchr/testify/assert"
+	assert "github.com/stretchr/testify/assert"
+	yaml "gopkg.in/yaml.v3"
 )
 
 func TestEvaluate(t *testing.T) {
+	var yml yaml.Node
+	err := yml.Encode(map[string][]interface{}{
+		"os":  {"Linux", "Windows"},
+		"foo": {"bar", "baz"},
+	})
+	assert.NoError(t, err)
+
 	rc := &RunContext{
 		Config: &Config{
 			Workdir: ".",
+			Secrets: map[string]string{
+				"CASE_INSENSITIVE_SECRET": "value",
+			},
 		},
 		Env: map[string]string{
 			"key": "value",
@@ -25,10 +37,7 @@ func TestEvaluate(t *testing.T) {
 				Jobs: map[string]*model.Job{
 					"job1": {
 						Strategy: &model.Strategy{
-							Matrix: map[string][]interface{}{
-								"os":  {"Linux", "Windows"},
-								"foo": {"bar", "baz"},
-							},
+							RawMatrix: yml,
 						},
 					},
 				},
@@ -40,22 +49,25 @@ func TestEvaluate(t *testing.T) {
 		},
 		StepResults: map[string]*stepResult{
 			"idwithnothing": {
+				Conclusion: stepStatusSuccess,
+				Outcome:    stepStatusFailure,
 				Outputs: map[string]string{
 					"foowithnothing": "barwithnothing",
 				},
-				Success: true,
 			},
 			"id-with-hyphens": {
+				Conclusion: stepStatusSuccess,
+				Outcome:    stepStatusFailure,
 				Outputs: map[string]string{
 					"foo-with-hyphens": "bar-with-hyphens",
 				},
-				Success: true,
 			},
 			"id_with_underscores": {
+				Conclusion: stepStatusSuccess,
+				Outcome:    stepStatusFailure,
 				Outputs: map[string]string{
 					"foo_with_underscores": "bar_with_underscores",
 				},
-				Success: true,
 			},
 		},
 	}
@@ -84,8 +96,11 @@ func TestEvaluate(t *testing.T) {
 		{"toJson({'foo':'bar'})", "{\n  \"foo\": \"bar\"\n}", ""},
 		{"(fromJSON('{\"foo\":\"bar\"}')).foo", "bar", ""},
 		{"(fromJson('{\"foo\":\"bar\"}')).foo", "bar", ""},
+		{"(fromJson('[\"foo\",\"bar\"]'))[1]", "bar", ""},
 		{"hashFiles('**/non-extant-files')", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", ""},
 		{"hashFiles('**/non-extant-files', '**/more-non-extant-files')", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", ""},
+		{"hashFiles('**/non.extant.files')", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", ""},
+		{"hashFiles('**/non''extant''files')", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", ""},
 		{"success()", "true", ""},
 		{"failure()", "false", ""},
 		{"always()", "true", ""},
@@ -95,26 +110,42 @@ func TestEvaluate(t *testing.T) {
 		{"github.run_id", "1", ""},
 		{"github.run_number", "1", ""},
 		{"job.status", "success", ""},
+		{"steps.idwithnothing.conclusion", "success", ""},
+		{"steps.idwithnothing.outcome", "failure", ""},
 		{"steps.idwithnothing.outputs.foowithnothing", "barwithnothing", ""},
+		{"steps.id-with-hyphens.conclusion", "success", ""},
+		{"steps.id-with-hyphens.outcome", "failure", ""},
 		{"steps.id-with-hyphens.outputs.foo-with-hyphens", "bar-with-hyphens", ""},
+		{"steps.id_with_underscores.conclusion", "success", ""},
+		{"steps.id_with_underscores.outcome", "failure", ""},
 		{"steps.id_with_underscores.outputs.foo_with_underscores", "bar_with_underscores", ""},
 		{"runner.os", "Linux", ""},
 		{"matrix.os", "Linux", ""},
 		{"matrix.foo", "bar", ""},
 		{"env.key", "value", ""},
+		{"secrets.CASE_INSENSITIVE_SECRET", "value", ""},
+		{"secrets.case_insensitive_secret", "value", ""},
+		{"format('{{0}}', 'test')", "{0}", ""},
+		{"format('{{{0}}}', 'test')", "{test}", ""},
+		{"format('}}')", "}", ""},
+		{"format('echo Hello {0} ${{Test}}', 'World')", "echo Hello World ${Test}", ""},
+		{"format('echo Hello {0} ${{Test}}', github.undefined_property)", "echo Hello  ${Test}", ""},
+		{"format('echo Hello {0}{1} ${{Te{0}st}}', github.undefined_property, 'World')", "echo Hello World ${Test}", ""},
+		{"format('{0}', '{1}', 'World')", "{1}", ""},
+		{"format('{{{0}', '{1}', 'World')", "{{1}", ""},
 	}
 
 	for _, table := range tables {
 		table := table
 		t.Run(table.in, func(t *testing.T) {
-			assert := a.New(t)
+			assertObject := assert.New(t)
 			out, _, err := ee.Evaluate(table.in)
 			if table.errMesg == "" {
-				assert.NoError(err, table.in)
-				assert.Equal(table.out, out, table.in)
+				assertObject.NoError(err, table.in)
+				assertObject.Equal(table.out, out, table.in)
 			} else {
-				assert.Error(err, table.in)
-				assert.Equal(table.errMesg, err.Error(), table.in)
+				assertObject.Error(err, table.in)
+				assertObject.Equal(table.errMesg, err.Error(), table.in)
 			}
 		})
 	}
@@ -124,6 +155,9 @@ func TestInterpolate(t *testing.T) {
 	rc := &RunContext{
 		Config: &Config{
 			Workdir: ".",
+			Secrets: map[string]string{
+				"CASE_INSENSITIVE_SECRET": "value",
+			},
 		},
 		Env: map[string]string{
 			"KEYWITHNOTHING":       "valuewithnothing",
@@ -151,6 +185,8 @@ func TestInterpolate(t *testing.T) {
 		{" ${{ env.KEYWITHNOTHING }} ", " valuewithnothing "},
 		{" ${{ env.KEY-WITH-HYPHENS }} ", " value-with-hyphens "},
 		{" ${{ env.KEY_WITH_UNDERSCORES }} ", " value_with_underscores "},
+		{"${{ secrets.CASE_INSENSITIVE_SECRET }}", "value"},
+		{"${{ secrets.case_insensitive_secret }}", "value"},
 		{"${{ env.UNKNOWN }}", ""},
 		{"${{ env.SOMETHING_TRUE }}", "true"},
 		{"${{ env.SOMETHING_FALSE }}", "false"},
@@ -175,9 +211,9 @@ func TestInterpolate(t *testing.T) {
 	for _, table := range tables {
 		table := table
 		t.Run(table.in, func(t *testing.T) {
-			assert := a.New(t)
+			assertObject := assert.New(t)
 			out := ee.Interpolate(table.in)
-			assert.Equal(table.out, out, table.in)
+			assertObject.Equal(table.out, out, table.in)
 		})
 	}
 }
@@ -185,17 +221,19 @@ func TestInterpolate(t *testing.T) {
 func updateTestExpressionWorkflow(t *testing.T, tables []struct {
 	in  string
 	out string
-	//wantErr bool
 }, rc *RunContext) {
-
 	var envs string
-	for k, v := range rc.Env {
-		envs += fmt.Sprintf(
-			`  %s: %s
-`, k, v)
+	keys := make([]string, 0, len(rc.Env))
+	for k := range rc.Env {
+		keys = append(keys, k)
 	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		envs += fmt.Sprintf("  %s: %s\n", k, rc.Env[k])
+	}
+
 	workflow := fmt.Sprintf(`
-name: "Test how expressions are handled on Github"
+name: "Test how expressions are handled on GitHub"
 on: push
 
 env:
@@ -212,12 +250,9 @@ jobs:
 		expr := expressionPattern.ReplaceAllStringFunc(table.in, func(match string) string {
 			return fmt.Sprintf("€{{ %s }}", expressionPattern.ReplaceAllString(match, "$1"))
 		})
-		name := fmt.Sprintf(`%s -> %s should be equal to %s`,expr, table.in, table.out)
+		name := fmt.Sprintf(`%s -> %s should be equal to %s`, expr, table.in, table.out)
 		echo := `run: echo "Done "`
-		workflow += fmt.Sprintf(`
-     - name: %s
-       %s
-`, name, echo)
+		workflow += fmt.Sprintf("\n      - name: %s\n        %s\n", name, echo)
 	}
 
 	file, err := os.Create("../../.github/workflows/test-expressions.yml")
@@ -229,7 +264,6 @@ jobs:
 	if err != nil {
 		t.Fatal(err)
 	}
-
 }
 
 func TestRewrite(t *testing.T) {
@@ -266,9 +300,9 @@ func TestRewrite(t *testing.T) {
 	for _, table := range tables {
 		table := table
 		t.Run(table.in, func(t *testing.T) {
-			assert := a.New(t)
+			assertObject := assert.New(t)
 			re := ee.Rewrite(table.in)
-			assert.Equal(table.re, re, table.in)
+			assertObject.Equal(table.re, re, table.in)
 		})
 	}
 }

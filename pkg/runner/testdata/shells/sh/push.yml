@@ -1,0 +1,23 @@
+on: push
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - shell: sh
+        run: |
+          if [ -z ${BASH+x} ]; then
+            echo "I'm sh!"
+          else
+            exit 1
+          fi
+  check-container:
+    runs-on: ubuntu-latest
+    container: alpine:latest
+    steps:
+      - shell: sh
+        run: |
+          if [ -z ${BASH+x} ]; then
+            echo "I'm sh!"
+          else
+            exit 1
+          fi

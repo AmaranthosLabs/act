@@ -5,6 +5,14 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
+    - uses: actions/checkout@v2
     - uses: ./actions/docker-local
+      id: dockerlocal
       with:
         who-to-greet: 'Mona the Octocat'
+    - run: '[[ "${{ env.SOMEVAR }}" == "Mona the Octocat" ]]'
+    - run: '[ "${SOMEVAR}" = "Not Mona" ] || exit 1'
+      env:
+        SOMEVAR: 'Not Mona'
+    - run: '[[ "${{ steps.dockerlocal.outputs.whoami }}" == "Mona the Octocat" ]]'
+    - uses: ./localdockerimagetest_

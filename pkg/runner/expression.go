@@ -4,22 +4,20 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/robertkrimen/otto"
 	log "github.com/sirupsen/logrus"
-	"gopkg.in/godo.v2/glob"
 )
 
-var contextPattern, expressionPattern, operatorPattern *regexp.Regexp
+var expressionPattern, operatorPattern *regexp.Regexp
 
 func init() {
-	contextPattern = regexp.MustCompile(`^([^.]*(?:\[.+])*)(?:\.([\w-]+))?(.*)$`)
 	expressionPattern = regexp.MustCompile(`\${{\s*(.+?)\s*}}`)
 	operatorPattern = regexp.MustCompile("^[!=><|&]+$")
 }
@@ -61,6 +59,9 @@ type expressionEvaluator struct {
 }
 
 func (ee *expressionEvaluator) Evaluate(in string) (string, bool, error) {
+	if strings.HasPrefix(in, `secrets.`) {
+		in = `secrets.` + strings.ToUpper(strings.SplitN(in, `.`, 2)[1])
+	}
 	re := ee.Rewrite(in)
 	if re != in {
 		log.Debugf("Evaluating '%s' instead of '%s'", re, in)
@@ -81,7 +82,7 @@ func (ee *expressionEvaluator) Evaluate(in string) (string, bool, error) {
 	return valAsString, val.IsString(), err
 }
 
-func (ee *expressionEvaluator) Interpolate(in string) string{
+func (ee *expressionEvaluator) Interpolate(in string) string {
 	interpolated, _ := ee.InterpolateWithStringCheck(in)
 	return interpolated
 }
@@ -120,22 +121,88 @@ func (ee *expressionEvaluator) InterpolateWithStringCheck(in string) (string, bo
 // Rewrite tries to transform any javascript property accessor into its bracket notation.
 // For instance, "object.property" would become "object['property']".
 func (ee *expressionEvaluator) Rewrite(in string) string {
-	re := in
+	var buf strings.Builder
+	r := strings.NewReader(in)
 	for {
-		matches := contextPattern.FindStringSubmatch(re)
-		if matches == nil {
-			// No global match, we're done!
+		c, _, err := r.ReadRune()
+		if err == io.EOF {
 			break
 		}
-		if matches[2] == "" {
-			// No property match, we're done!
-			break
+		//nolint
+		switch {
+		default:
+			buf.WriteRune(c)
+		case c == '\'':
+			buf.WriteRune(c)
+			ee.advString(&buf, r)
+		case c == '.':
+			buf.WriteString("['")
+			ee.advPropertyName(&buf, r)
+			buf.WriteString("']")
 		}
-
-		re = fmt.Sprintf("%s['%s']%s", matches[1], matches[2], matches[3])
 	}
+	return buf.String()
+}
 
-	return re
+func (*expressionEvaluator) advString(w *strings.Builder, r *strings.Reader) error {
+	for {
+		c, _, err := r.ReadRune()
+		if err != nil {
+			return err
+		}
+		if c != '\'' {
+			w.WriteRune(c) //nolint
+			continue
+		}
+
+		// Handles a escaped string: ex. 'It''s ok'
+		c, _, err = r.ReadRune()
+		if err != nil {
+			w.WriteString("'") //nolint
+			return err
+		}
+		if c != '\'' {
+			w.WriteString("'") //nolint
+			if err := r.UnreadRune(); err != nil {
+				return err
+			}
+			break
+		}
+		w.WriteString(`\'`) //nolint
+	}
+	return nil
+}
+
+func (*expressionEvaluator) advPropertyName(w *strings.Builder, r *strings.Reader) error {
+	for {
+		c, _, err := r.ReadRune()
+		if err != nil {
+			return err
+		}
+		if !isLetter(c) {
+			if err := r.UnreadRune(); err != nil {
+				return err
+			}
+			break
+		}
+		w.WriteRune(c) //nolint
+	}
+	return nil
+}
+
+func isLetter(c rune) bool {
+	switch {
+	case c >= 'a' && c <= 'z':
+		return true
+	case c >= 'A' && c <= 'Z':
+		return true
+	case c >= '0' && c <= '9':
+		return true
+	case c == '_' || c == '-':
+		return true
+	default:
+		return false
+	}
 }
 
 func (rc *RunContext) newVM() *otto.Otto {
@@ -162,6 +229,7 @@ func (rc *RunContext) newVM() *otto.Otto {
 		rc.vmStrategy(),
 		rc.vmMatrix(),
 		rc.vmEnv(),
+		rc.vmNeeds(),
 	}
 	vm := otto.New()
 	for _, configer := range configers {
@@ -198,11 +266,35 @@ func vmEndsWith(vm *otto.Otto) {
 }
 
 func vmFormat(vm *otto.Otto) {
-	_ = vm.Set("format", func(s string, vals ...string) string {
-		for i, v := range vals {
-			s = strings.ReplaceAll(s, fmt.Sprintf("{%d}", i), v)
-		}
-		return s
+	_ = vm.Set("format", func(s string, vals ...otto.Value) string {
+		ex := regexp.MustCompile(`(\{[0-9]+\}|\{.?|\}.?)`)
+		return ex.ReplaceAllStringFunc(s, func(seg string) string {
+			switch seg {
+			case "{{":
+				return "{"
+			case "}}":
+				return "}"
+			default:
+				if len(seg) < 3 || !strings.HasPrefix(seg, "{") {
+					log.Errorf("The following format string is invalid: '%v'", s)
+					return ""
+				}
+				_i := seg[1 : len(seg)-1]
+				i, err := strconv.ParseInt(_i, 10, 32)
+				if err != nil {
+					log.Errorf("The following format string is invalid: '%v'. Error: %v", s, err)
+					return ""
+				}
+				if i >= int64(len(vals)) {
+					log.Errorf("The following format string references more arguments than were supplied: '%v'", s)
+					return ""
+				}
+				if vals[i].IsNull() || vals[i].IsUndefined() {
+					return ""
+				}
+				return vals[i].String()
+			}
+		})
 	})
 }
 
@@ -235,8 +327,8 @@ func vmToJSON(vm *otto.Otto) {
 }
 
 func vmFromJSON(vm *otto.Otto) {
-	fromJSON := func(str string) map[string]interface{} {
-		var dat map[string]interface{}
+	fromJSON := func(str string) interface{} {
+		var dat interface{}
 		err := json.Unmarshal([]byte(str), &dat)
 		if err != nil {
 			log.Errorf("Unable to unmarshal: %v", err)
@@ -251,9 +343,9 @@ func vmFromJSON(vm *otto.Otto) {
 func (rc *RunContext) vmHashFiles() func(*otto.Otto) {
 	return func(vm *otto.Otto) {
 		_ = vm.Set("hashFiles", func(paths ...string) string {
-			var files []*glob.FileAsset
+			var files []string
 			for i := range paths {
-				newFiles, _, err := glob.Glob([]string{filepath.Join(rc.Config.Workdir, paths[i])})
+				newFiles, err := filepath.Glob(filepath.Join(rc.Config.Workdir, paths[i]))
 				if err != nil {
 					log.Errorf("Unable to glob.Glob: %v", err)
 					return ""
@@ -262,7 +354,7 @@ func (rc *RunContext) vmHashFiles() func(*otto.Otto) {
 			}
 			hasher := sha256.New()
 			for _, file := range files {
-				f, err := os.Open(file.Path)
+				f, err := os.Open(file)
 				if err != nil {
 					log.Errorf("Unable to os.Open: %v", err)
 				}
@@ -335,15 +427,33 @@ func (sc *StepContext) vmInputs() func(*otto.Otto) {
 	// Set Defaults
 	if sc.Action != nil {
 		for k, input := range sc.Action.Inputs {
-			inputs[k] = input.Default
+			inputs[k] = sc.RunContext.NewExpressionEvaluator().Interpolate(input.Default)
 		}
 	}
 
 	for k, v := range sc.Step.With {
-		inputs[k] = v
+		inputs[k] = sc.RunContext.NewExpressionEvaluator().Interpolate(v)
 	}
+
 	return func(vm *otto.Otto) {
 		_ = vm.Set("inputs", inputs)
+	}
+}
+
+func (rc *RunContext) vmNeeds() func(*otto.Otto) {
+	jobs := rc.Run.Workflow.Jobs
+	jobNeeds := rc.Run.Job().Needs()
+
+	using := make(map[string]map[string]map[string]string)
+	for _, needs := range jobNeeds {
+		using[needs] = map[string]map[string]string{
+			"outputs": jobs[needs].Outputs,
+		}
+	}
+
+	return func(vm *otto.Otto) {
+		log.Debugf("context needs => %v", using)
+		_ = vm.Set("needs", using)
 	}
 }
 
@@ -356,9 +466,19 @@ func (rc *RunContext) vmJob() func(*otto.Otto) {
 }
 
 func (rc *RunContext) vmSteps() func(*otto.Otto) {
-	steps := rc.getStepsContext()
+	ctxSteps := rc.getStepsContext()
+
+	steps := make(map[string]interface{})
+	for id, ctxStep := range ctxSteps {
+		steps[id] = map[string]interface{}{
+			"conclusion": ctxStep.Conclusion.String(),
+			"outcome":    ctxStep.Outcome.String(),
+			"outputs":    ctxStep.Outputs,
+		}
+	}
 
 	return func(vm *otto.Otto) {
+		log.Debugf("context steps => %v", steps)
 		_ = vm.Set("steps", steps)
 	}
 }
